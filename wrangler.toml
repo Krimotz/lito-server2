@@ -1,0 +1,12 @@
+name = "lito-server2"
+main = "src/index.js"
+compatibility_date = "2026-09-22"
+
+# Durable Object binding and migration
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
