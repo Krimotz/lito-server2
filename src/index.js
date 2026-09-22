@@ -45,6 +45,21 @@ export class RelayRoom {
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('ping', 'pong')
     );
+
+    // Heartbeat: send a message every 30 seconds to every connected client.
+    // Cloudflare kills WebSockets that have been idle for 100 seconds on
+    // the Free plan. This message resets that timer.
+    this.heartbeatInterval = setInterval(() => {
+      for (const [ws, session] of this.sessions) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          } catch (_) {
+            // Client may have disconnected between loop start and now.
+          }
+        }
+      }
+    }, 30000);
   }
 
   async fetch(request) {
