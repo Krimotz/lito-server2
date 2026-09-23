@@ -32,31 +32,28 @@ export class RelayRoom {
     this.state = state;
     this.env = env;
 
-    // Restore any hibernating sessions from attachments
-    this.sessions = new Map();
+    this.sessions = new Map();       // ws -> { role }
+    this.broadcaster = null;         // ws | null, the active broadcaster
+    this.graceTimer = null;          // pending room-cleanup timer, if any
+
     for (const ws of this.state.getWebSockets()) {
       const attachment = ws.deserializeAttachment();
       if (attachment) {
         this.sessions.set(ws, attachment);
+        if (attachment.role === 'broadcast') {
+          this.broadcaster = ws;
+        }
       }
     }
 
-    // Auto-reply to ping/pong without waking from hibernation
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('ping', 'pong')
     );
 
-    // Heartbeat: send a message every 30 seconds to every connected client.
-    // Cloudflare kills WebSockets that have been idle for 100 seconds on
-    // the Free plan. This message resets that timer.
     this.heartbeatInterval = setInterval(() => {
-      for (const [ws, session] of this.sessions) {
+      for (const [ws] of this.sessions) {
         if (ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          } catch (_) {
-            // Client may have disconnected between loop start and now.
-          }
+          try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
         }
       }
     }, 30000);
@@ -70,57 +67,91 @@ export class RelayRoom {
       return new Response('Invalid role', { status: 400 });
     }
 
-    // Create WebSocket pair
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Accept the WebSocket with hibernation support
     this.state.acceptWebSocket(server);
 
-    // Persist role so it survives hibernation
     const attachment = { role };
     server.serializeAttachment(attachment);
     this.sessions.set(server, attachment);
 
-    // Send confirmation to client
-    server.send(JSON.stringify({ type: 'joined', role }));
+    // A new broadcaster takes over the slot. Evict any existing one.
+    if (role === 'broadcast') {
+      if (this.broadcaster && this.broadcaster !== server) {
+        try {
+          this.broadcaster.close(4001, 'replaced by new broadcaster');
+        } catch (_) {}
+        this.sessions.delete(this.broadcaster);
+      }
+      this.broadcaster = server;
+    }
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-    });
+    // Cancel any pending room GC.
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+
+    server.send(JSON.stringify({ type: 'joined', role }));
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws, message) {
     const session = this.sessions.get(ws);
     if (!session) return;
 
-    // Only broadcasters originate audio. Listeners don't send.
-    if (session.role !== 'broadcast') return;
+    // Only the active broadcaster may originate audio or control frames.
+    if (ws !== this.broadcaster) return;
 
-    // Relay binary audio to all listeners
     if (typeof message === 'string') {
-      // Text frames are control messages — relay to all as-is
+      // Control frames: relay to listeners only, not other broadcasters.
       for (const [peer, peerSession] of this.sessions) {
-        if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+        if (peer !== ws
+            && peerSession.role === 'listen'
+            && peer.readyState === WebSocket.OPEN) {
           peer.send(message);
         }
       }
     } else {
-      // Binary frames are audio — relay to listeners only
+      // Binary audio: relay to listeners only.
       for (const [peer, peerSession] of this.sessions) {
-        if (peer !== ws && peerSession.role === 'listen' && peer.readyState === WebSocket.OPEN) {
+        if (peer !== ws
+            && peerSession.role === 'listen'
+            && peer.readyState === WebSocket.OPEN) {
           peer.send(message);
         }
       }
     }
   }
 
-  async webSocketClose(ws, code, reason) {
+  async webSocketClose(ws) {
     this.sessions.delete(ws);
+    if (ws === this.broadcaster) {
+      this.broadcaster = null;
+      this.scheduleRoomGc();
+    }
   }
 
-  async webSocketError(ws, error) {
+  async webSocketError(ws) {
     this.sessions.delete(ws);
+    if (ws === this.broadcaster) {
+      this.broadcaster = null;
+      this.scheduleRoomGc();
+    }
+  }
+
+  scheduleRoomGc() {
+    // If no listeners remain AND no broadcaster, close the DO after grace.
+    // If listeners remain, keep the room alive indefinitely so they can
+    // hear the broadcaster when they return.
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    this.graceTimer = setTimeout(() => {
+      if (!this.broadcaster && this.sessions.size === 0) {
+        // Nothing left; let the DO hibernate/evict naturally.
+        // No explicit close needed — DOs idle out.
+      }
+      this.graceTimer = null;
+    }, 10 * 60 * 1000);
   }
 }
